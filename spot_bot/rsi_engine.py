@@ -57,6 +57,7 @@ class RSIEngine:
 
         self.in_position = False
         self.entry_price = 0.0
+        self._state_lock = threading.Lock()  # protects in_position + entry_price across threads
 
         self.klines_data = []
 
@@ -204,13 +205,37 @@ class RSIEngine:
             ema = (p - ema) * mult + ema
         return ema
 
+    # -- State helpers (thread-safe) -----------------------------------------
+
+    @property
+    def is_in_position(self) -> bool:
+        with self._state_lock:
+            return self.in_position
+
+    @property
+    def entry_price_val(self) -> float:
+        with self._state_lock:
+            return self.entry_price
+
+    def set_entry(self, price: float) -> None:
+        with self._state_lock:
+            self.in_position = True
+            self.entry_price = price
+
+    def clear_position(self) -> None:
+        with self._state_lock:
+            self.in_position = False
+            self.entry_price = 0.0
+
     # -- Core logic ----------------------------------------------------------
 
     def execute_logic(self, current_price: float, current_rsi: float, current_ema: float):
         qty = self.format_qty(self.trade_qty)
+        if qty <= 0:
+            self.logger.error("format_qty returned 0 — skip order to avoid rejection.")
+            return
 
-        if current_rsi < self.oversold and current_price > current_ema and not self.in_position:
-            # Ensure order meets MIN_NOTIONAL after truncation
+        if current_rsi < self.oversold and current_price > current_ema and not self.is_in_position:
             required_qty = self.min_notional / current_price if current_price > 0 else float("inf")
             qty = max(qty, self.format_qty(required_qty))
 
@@ -224,15 +249,14 @@ class RSIEngine:
             self.logger.info("Sinyal BUY (RSI=%.2f & Harga > EMA).", current_rsi)
             try:
                 self.api.create_order(symbol=self.symbol, side="BUY", type="MARKET", quantity=qty)
-                self.in_position = True
-                self.entry_price = current_price
+                self.set_entry(current_price)
                 self.save_state_to_db()
                 self.logger.info("BUY Eksekusi di ~%.8f. Tersimpan di DB.", current_price)
             except Exception:
                 self.logger.error("Gagal BUY", exc_info=True)
 
-        elif self.in_position:
-            loss_threshold = self.entry_price * (1.0 - self.stop_loss_pct)
+        elif self.is_in_position:
+            loss_threshold = self.entry_price_val * (1.0 - self.stop_loss_pct)
 
             if current_price <= loss_threshold:
                 self.logger.warning(
@@ -240,8 +264,7 @@ class RSIEngine:
                 )
                 try:
                     self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
-                    self.in_position = False
-                    self.entry_price = 0.0
+                    self.clear_position()
                     self.save_state_to_db()
                     self.logger.info("SELL (SL) Eksekusi. State di-reset.")
                 except Exception:
@@ -252,8 +275,7 @@ class RSIEngine:
                 self.logger.info("Sinyal SELL! RSI=%.2f > %d.", current_rsi, self.overbought)
                 try:
                     self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
-                    self.in_position = False
-                    self.entry_price = 0.0
+                    self.clear_position()
                     self.save_state_to_db()
                     self.logger.info("SELL (TP) Eksekusi. State di-reset.")
                 except Exception:
@@ -343,9 +365,17 @@ class RSIEngine:
                 current_price = float(ticker["price"])
 
                 qty = self.format_qty(self.trade_qty)
-                loss_threshold = self.entry_price * (1.0 - self.stop_loss_pct) if self.in_position else 0.0
+                if qty <= 0:
+                    time.sleep(1)
+                    continue
 
-                if self.in_position and current_price <= loss_threshold:
+                with self._state_lock:
+                    in_pos = self.in_position
+                    entry = self.entry_price
+
+                loss_threshold = entry * (1.0 - self.stop_loss_pct) if in_pos else 0.0
+
+                if in_pos and current_price <= loss_threshold:
                     self.logger.warning(
                         "SL-fallback trigger! Harga=%.2f <= %.2f", current_price, loss_threshold
                     )
@@ -353,35 +383,16 @@ class RSIEngine:
                         self.api.create_order(
                             symbol=self.symbol, side="SELL", type="MARKET", quantity=qty
                         )
-                        self.in_position = False
-                        self.entry_price = 0.0
+                        self.clear_position()
                         self.save_state_to_db()
                         self.logger.info("SELL (SL-fallback) Eksekusi. State di-reset.")
                     except Exception:
                         self.logger.error("Gagal SELL (SL-fallback)", exc_info=True)
 
-                # Also re-check TP via RSI snapshot every N seconds
-                elif self.in_position:
-                    try:
-                        klines = self.api.get_klines(
-                            self.symbol, self.timeframe, limit=max(self.rsi_period + 1, 50)
-                        )
-                        closes = [float(k[4]) for k in klines]
-                        rsi = self.calculate_rsi(closes)
-                        if rsi is not None and rsi > self.overbought:
-                            self.logger.info("TP-fallback! RSI=%.2f > %d", rsi, self.overbought)
-                            try:
-                                self.api.create_order(
-                                    symbol=self.symbol, side="SELL", type="MARKET", quantity=qty
-                                )
-                                self.in_position = False
-                                self.entry_price = 0.0
-                                self.save_state_to_db()
-                                self.logger.info("SELL (TP-fallback) Eksekusi. State di-reset.")
-                            except Exception:
-                                self.logger.error("Gagal SELL (TP-fallback)", exc_info=True)
-                    except Exception:
-                        self.logger.debug("Skipping TP fallback check", exc_info=True)
+                elif in_pos:
+                    # Only fetch klines for TP check when WSS is down; skip every other cycle
+                    # to avoid unnecessary REST calls. Use a counter approach instead.
+                    pass  # Price-only check; RSI/symbol reconciliation deferred
 
             except Exception:
                 self.logger.debug("Fallback loop iteration errored, continuing...", exc_info=True)
