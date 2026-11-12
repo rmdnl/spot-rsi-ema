@@ -26,29 +26,46 @@ def main():
         timeout=int(os.getenv("API_TIMEOUT", "10")),
     )
 
-    bot = RSIEngine(
-        api_client=api_client,
-        symbol=os.getenv("SYMBOL", "BTCUSDT"),
-        trade_qty=float(os.getenv("TRADE_QTY", "0.005")),
-        timeframe=os.getenv("TIMEFRAME", "15m"),
-        rsi_period=int(os.getenv("RSI_PERIOD", "14")),
-        ema_period=int(os.getenv("EMA_PERIOD", "200")),
-        oversold=int(os.getenv("OVERSOLD", "30")),
-        overbought=int(os.getenv("OVERBOUGHT", "70")),
-        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.02")),
-        db_path=os.getenv("DB_PATH", "binance_bot.db"),
-        api_timeout=int(os.getenv("API_TIMEOUT", "10")),
-        sl_fallback_interval=int(os.getenv("SL_FALLBACK_INTERVAL", "30")),
-    )
+    symbols = [s.strip().upper() for s in os.getenv("SYMBOLS", "BTCUSDT").split(",") if s.strip()]
+    import threading
+    bots = []
+    for sym in symbols:
+        b = RSIEngine(
+            api_client=api_client,
+            symbol=sym,
+            trade_qty=float(os.getenv("TRADE_QTY", "0.005")),
+            timeframe=os.getenv("TIMEFRAME", "15m"),
+            rsi_period=int(os.getenv("RSI_PERIOD", "14")),
+            ema_period=int(os.getenv("EMA_PERIOD", "200")),
+            oversold=int(os.getenv("OVERSOLD", "30")),
+            overbought=int(os.getenv("OVERBOUGHT", "70")),
+            stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.02")),
+            db_path=os.getenv("DB_PATH", "binance_bot.db"),
+            sl_fallback_interval=int(os.getenv("SL_FALLBACK_INTERVAL", "30")),
+        )
+        bots.append(b)
+        logging.info("Bot untuk %s siap.", sym)
+
+    def run_all():
+        threads = []
+        for bot in bots:
+            t = threading.Thread(target=bot.run, daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
     try:
-        bot.start_sl_fallback()
-        bot.run()
+        for bot in bots:
+            bot.start_sl_fallback()
+        run_all()
     except KeyboardInterrupt:
-        bot.shutdown()
+        for bot in bots:
+            bot.shutdown()
         logging.info("Bot dihentikan secara manual (Ctrl+C).")
     except Exception as e:
-        bot.shutdown()
+        for bot in bots:
+            bot.shutdown()
         logging.error("Bot berhenti karena error fatal: %s", str(e))
 
 

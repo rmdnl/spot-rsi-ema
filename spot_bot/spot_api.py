@@ -3,9 +3,36 @@ import time
 import hmac
 import hashlib
 import logging
+import threading
 from urllib.parse import urlencode
 
 import requests
+
+
+class RateLimiter:
+    """Token-bucket rate limiter untuk mematuhi Binance API limits."""
+
+    def __init__(self, rate_per_min: int = 1200):
+        self._rate = rate_per_min
+        self._bucket_size = float(rate_per_min)
+        self._tokens = self._bucket_size
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._bucket_size, self._tokens + elapsed * (self._rate / 60.0))
+        self._last_refill = now
+
+    def acquire(self) -> None:
+        with self._lock:
+            self._refill()
+            while self._tokens < 1.0:
+                wait = (1.0 - self._tokens) / (self._rate / 60.0)
+                time.sleep(wait)
+                self._refill()
+            self._tokens -= 1.0
 
 
 class SpotAPI:
@@ -13,6 +40,7 @@ class SpotAPI:
         self.api_key = api_key
         self.api_secret = api_secret
         self.timeout = timeout
+        self._rate_limiter = RateLimiter()
 
         env = os.getenv("ENVIRONMENT", "testnet").lower()
         if env == "production":
@@ -39,6 +67,8 @@ class SpotAPI:
     def _request(self, method: str, endpoint: str, params: dict | None = None, signed: bool = False) -> dict:
         url = self.base_url + endpoint
         params = params or {}
+        # Throttle to respect Binance rate limits
+        self._rate_limiter.acquire()
 
         if signed:
             params["timestamp"] = int(time.time() * 1000)
@@ -52,8 +82,6 @@ class SpotAPI:
         except requests.exceptions.HTTPError as err:
             status = getattr(err.response, "status_code", "?")
             body = err.response.text if err.response is not None else ""
-            # Log only a safe excerpt — never surface the full traceback
-            # which could contain keys in the Authorization header.
             self.logger.error("HTTP %s %s: status=%s", method, endpoint, status)
             if body:
                 self.logger.debug("Response body (truncated): %.200s", body)
@@ -91,3 +119,9 @@ class SpotAPI:
             params["price"] = price
             params["timeInForce"] = "GTC"
         return self._request("POST", "/api/v3/order", params=params, signed=True)
+
+    def get_open_orders(self, symbol: str) -> list:
+        return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol})
+
+    def get_account_balance(self) -> dict:
+        return self._request("GET", "/api/v3/account", signed=True)

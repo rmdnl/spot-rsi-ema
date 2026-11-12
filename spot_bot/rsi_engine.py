@@ -54,10 +54,15 @@ class RSIEngine:
         self.stop_loss_pct = stop_loss_pct
         self.db_path = db_path
         self.sl_fallback_interval = sl_fallback_interval
+        self.max_drawdown_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
+        self.use_partial_tp = os.getenv("USE_PARTIAL_TP", "true").lower() == "true"
+        self.partial_tp_ratio = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))
+        self.trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT", "0.01"))
 
         self.in_position = False
         self.entry_price = 0.0
         self._state_lock = threading.Lock()  # protects in_position + entry_price across threads
+        self.pending_sell = False             # order sudah dikirim tapi belum dikonfirmasi filled
 
         self.klines_data = []
 
@@ -120,6 +125,10 @@ class RSIEngine:
                 )
             else:
                 self.logger.info("Tidak ada state sebelumnya di DB. Memulai dari kondisi awal.")
+            conn.close()
+            # Reconcile dengan exchange untuk memastikan state sinkron
+            if self.in_position:
+                self.reconcile_with_exchange()
         except Exception:
             self.logger.error("Gagal sinkronisasi state dari database", exc_info=True)
 
@@ -139,6 +148,35 @@ class RSIEngine:
             conn.close()
         except Exception:
             self.logger.error("Gagal menyimpan state ke database", exc_info=True)
+
+    # -- State reconciliation ------------------------------------------------
+
+    def reconcile_with_exchange(self) -> None:
+        """Cross-check DB state against actual open orders on Binance."""
+        try:
+            open_orders = self.api.get_open_orders(self.symbol)
+            open_positions = [o for o in open_orders if o.get("status") == "NEW"]
+            if self.in_position and not open_positions:
+                self.clear_position()
+                self.save_state_to_db()
+                self.logger.warning(
+                    "Reconcile: posisi di DB tapi tidak ada open order di exchange. Reset state."
+                )
+            elif not self.in_position and open_positions:
+                for o in open_positions:
+                    if o.get("side") == "BUY":
+                        qty = float(o.get("executedQty", 0))
+                        avg_price = float(o.get("avgPrice", 0))
+                        if qty > 0 and avg_price > 0:
+                            self.set_entry(avg_price)
+                            self.save_state_to_db()
+                            self.logger.warning(
+                                "Reconcile: membuka ulang posisi dari order terbuka — entry=%.8f qty=%.8f",
+                                avg_price, qty,
+                            )
+                            break
+        except Exception:
+            self.logger.error("Gagal reconciliasi dengan exchange", exc_info=True)
 
     # -- Exchange info -------------------------------------------------------
 
@@ -235,6 +273,18 @@ class RSIEngine:
             self.logger.error("format_qty returned 0 — skip order to avoid rejection.")
             return
 
+        # Check max drawdown cap while holding position
+        if self.is_in_position:
+            loss_threshold = self.entry_price_val * (1.0 - self.stop_loss_pct)
+            max_allowed_loss = self.entry_price_val * self.max_drawdown_pct
+            if current_price < (self.entry_price_val - max_allowed_loss):
+                self.logger.warning(
+                    "Max drawdown reached (%.1f%%). Force closing position.",
+                    self.max_drawdown_pct * 100,
+                )
+                self._do_sell(current_price, qty, reason="max_drawdown")
+                return
+
         if current_rsi < self.oversold and current_price > current_ema and not self.is_in_position:
             required_qty = self.min_notional / current_price if current_price > 0 else float("inf")
             qty = max(qty, self.format_qty(required_qty))
@@ -257,29 +307,56 @@ class RSIEngine:
 
         elif self.is_in_position:
             loss_threshold = self.entry_price_val * (1.0 - self.stop_loss_pct)
+            profit_target = self.entry_price_val * (1.0 + self.stop_loss_pct * 2)
+            trailing_threshold = self._calc_trailing_stop(current_price)
 
-            if current_price <= loss_threshold:
+            if current_price <= loss_threshold or current_price <= trailing_threshold:
                 self.logger.warning(
                     "STOP LOSS! Harga=%.2f <= threshold=%.2f", current_price, loss_threshold
                 )
-                try:
-                    self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
-                    self.clear_position()
-                    self.save_state_to_db()
-                    self.logger.info("SELL (SL) Eksekusi. State di-reset.")
-                except Exception:
-                    self.logger.error("Gagal SELL (SL)", exc_info=True)
+                self._do_sell(current_price, qty, reason="stop_loss")
                 return
 
             if current_rsi > self.overbought:
-                self.logger.info("Sinyal SELL! RSI=%.2f > %d.", current_rsi, self.overbought)
-                try:
-                    self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
-                    self.clear_position()
-                    self.save_state_to_db()
-                    self.logger.info("SELL (TP) Eksekusi. State di-reset.")
-                except Exception:
-                    self.logger.error("Gagal SELL", exc_info=True)
+                if self.use_partial_tp and current_price >= profit_target:
+                    sell_qty = qty * self.partial_tp_ratio
+                    self.logger.info(
+                        "Partial TP! RSI=%.2f, Harga=%.2f >= target=%.2f. Jual %.6f (%.0f%%).",
+                        current_rsi, current_price, profit_target, sell_qty,
+                        self.partial_tp_ratio * 100,
+                    )
+                    self._do_sell(current_price, sell_qty, reason="partial_tp")
+                else:
+                    self.logger.info("Sinyal SELL! RSI=%.2f > %d.", current_rsi, self.overbought)
+                    self._do_sell(current_price, qty, reason="tp")
+
+    def _calc_trailing_stop(self, current_price: float) -> float:
+        """Calculate dynamic trailing stop based on highest price since entry."""
+        with self._state_lock:
+            entry = self.entry_price
+        peak = max(self.klines_data) if self.klines_data else current_price
+        if peak > current_price:
+            return peak * (1.0 - self.trailing_stop_pct)
+        return entry * (1.0 - self.stop_loss_pct)
+
+    def _do_sell(self, current_price: float, qty: float, reason: str) -> None:
+        """Execute market sell with pending-order guard against double-sell."""
+        with self._state_lock:
+            if self.pending_sell:
+                self.logger.debug("Sell order sudah dikirim, menunggu konfirmasi...")
+                return
+            self.pending_sell = True
+        try:
+            self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
+            self.logger.info("SELL (%s) Eksekusi di ~%.8f qty=%.8f.", reason, current_price, qty)
+            self.clear_position()
+            self.save_state_to_db()
+        except Exception:
+            self.logger.error("Gagal SELL (%s)", reason, exc_info=True)
+        finally:
+            time.sleep(2)
+            with self._state_lock:
+                self.pending_sell = False
 
     # -- WebSocket -----------------------------------------------------------
 
