@@ -4,8 +4,10 @@ import logging
 import sqlite3
 import threading
 import json
+import os
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 import websocket
+from spot_bot.telegram_notif import build_notifier
 
 
 # ---------- helpers --------------------------------------------------------
@@ -77,6 +79,13 @@ class RSIEngine:
 
         self._running = False          # flag for graceful shutdown
         self._fallback_thread = None
+
+        # Telegram notifier (may be None if not configured)
+        self.notifier = build_notifier({
+            "TELEGRAM_BOT_TOKEN":   os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_CHAT_IDS":    os.getenv("TELEGRAM_CHAT_IDS", ""),
+            "TELEGRAM_NOTIFY_ERRORS": os.getenv("TELEGRAM_NOTIFY_ERRORS", "true"),
+        })
 
         self.init_db()
         self.sync_state_from_db()
@@ -162,9 +171,10 @@ class RSIEngine:
             if self.in_position and not open_positions:
                 self.clear_position()
                 self.save_state_to_db()
-                self.logger.warning(
-                    "Reconcile: posisi di DB tapi tidak ada open order di exchange. Reset state."
-                )
+                msg = f"Reconcile {self.symbol}: posisi di DB tapi tidak ada order terbuka. Reset."
+                self.logger.warning(msg)
+                if self.notifier:
+                    self.notifier.reconcile(msg)
             elif not self.in_position and open_positions:
                 for o in open_positions:
                     if o.get("side") == "BUY":
@@ -173,13 +183,16 @@ class RSIEngine:
                         if qty > 0 and avg_price > 0:
                             self.set_entry(avg_price)
                             self.save_state_to_db()
-                            self.logger.warning(
-                                "Reconcile: membuka ulang posisi dari order terbuka — entry=%.8f qty=%.8f",
-                                avg_price, qty,
-                            )
+                            msg = (f"Reconcile {self.symbol}: buka ulang posisi — "
+                                   f"entry={avg_price:.8f} qty={qty:.8f}")
+                            self.logger.warning(msg)
+                            if self.notifier:
+                                self.notifier.reconcile(msg)
                             break
         except Exception:
             self.logger.error("Gagal reconciliasi dengan exchange", exc_info=True)
+            if self.notifier:
+                self.notifier.error(f"Reconcile gagal untuk {self.symbol}")
 
     # -- Exchange info -------------------------------------------------------
 
@@ -369,10 +382,10 @@ class RSIEngine:
             try:
                 # Pre-flight: cek saldo USDT cukup (> min_notional)
                 if not self._balance_check(self.min_notional):
-                    self.logger.warning(
-                        "Saldo USDT tidak cukup untuk buy. Skip. (min_notional=%.2f)",
-                        self.min_notional,
-                    )
+                    msg = f"Saldo USDT tidak cukup untuk buy {self.symbol} (min_notional={self.min_notional:.2f})"
+                    self.logger.warning(msg)
+                    if self.notifier:
+                        self.notifier.warn(msg)
                     return
 
                 resp = self.api.create_order(
@@ -400,6 +413,8 @@ class RSIEngine:
                     "BUY CONFIRMED — orderId=%d, avgPrice=%.8f qty=%.8f",
                     order_id, fill_price, qty,
                 )
+                if self.notifier:
+                    self.notifier.buy(self.symbol, fill_price, qty, order_id)
             except Exception:
                 self.logger.error("Gagal BUY atau konfirmasi gagal", exc_info=True)
 
@@ -449,8 +464,30 @@ class RSIEngine:
             self.logger.info("SELL (%s) Eksekusi di ~%.8f qty=%.8f.", reason, current_price, qty)
             self.clear_position()
             self.save_state_to_db()
+            # Notify Telegram with contextual info
+            if self.notifier:
+                entry = self.entry_price_val  # already cleared, but saved to DB before; use last known
+                # Recompute from DB as fallback
+                try:
+                    conn = sqlite3.connect(self.db_path)
+                    row = conn.execute(
+                        "SELECT entry_price FROM bot_state WHERE symbol=?", (self.symbol,)
+                    ).fetchone()
+                    conn.close()
+                    entry = float(row[0]) if row else 0.0
+                except Exception:
+                    pass
+                pct_change = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
+                self.notifier.sell(
+                    self.symbol, current_price, reason,
+                    pct=pct_change,
+                    peak=current_price if reason == "trailing_stop" else None,
+                    sold_pct=(self.partial_tp_ratio * 100) if reason == "partial_tp" else None,
+                )
         except Exception:
             self.logger.error("Gagal SELL (%s)", reason, exc_info=True)
+            if self.notifier:
+                self.notifier.error(f"SELL {reason} gagal untuk {self.symbol}")
         finally:
             time.sleep(2)
             with self._state_lock:
@@ -492,6 +529,8 @@ class RSIEngine:
 
     def on_close(self, ws, close_status_code, close_msg):
         self.logger.warning("WebSocket Terputus. Auto-reconnect dalam 5 detik...")
+        if self.notifier:
+            self.notifier.warn(f"WS disconnect {self.symbol} (code={close_status_code})")
         if not self._running:
             return
         time.sleep(5)
@@ -518,6 +557,9 @@ class RSIEngine:
             on_close=self.on_close,
         )
         self._running = True
+        if self.notifier:
+            env = os.getenv("ENVIRONMENT", "testnet")
+            self.notifier.start([self.symbol], env)
         ws.run_forever()
         self._running = False
 
@@ -554,6 +596,9 @@ class RSIEngine:
                     self.logger.warning(
                         "SL-fallback trigger! Harga=%.2f <= %.2f", current_price, loss_threshold
                     )
+                    if self.notifier:
+                        pct = -self.stop_loss_pct * 100
+                        self.notifier.sell(self.symbol, current_price, "stop_loss", pct=pct)
                     try:
                         self.api.create_order(
                             symbol=self.symbol, side="SELL", type="MARKET", quantity=qty
@@ -563,6 +608,8 @@ class RSIEngine:
                         self.logger.info("SELL (SL-fallback) Eksekusi. State di-reset.")
                     except Exception:
                         self.logger.error("Gagal SELL (SL-fallback)", exc_info=True)
+                        if self.notifier:
+                            self.notifier.error(f"SL-fallback SELL gagal {self.symbol}")
 
                 elif in_pos:
                     # Only fetch klines for TP check when WSS is down; skip every other cycle

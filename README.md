@@ -22,6 +22,7 @@ Bot ini dirancang agar ringan, responsif (menggunakan WebSocket), dan aman dari 
 - **Exchange Reconciliation**: Memverifikasi state DB dengan open orders riil di exchange setelah restart.
 - **Rate Limiter**: Token-bucket limiter mencegah ban dari Binance (1200 req/min).
 - **Multi-Symbol Support**: Bisa trading banyak pasangan sekaligus (`SYMBOLS=BTCUSDT,ETHUSDT`).
+- **Telegram Notifications**: Notifikasi real-time ke Telegram untuk setiap BUY, SELL (SL/TP/partial/trailing/max-drawdown), reconnect, reconcile, dan error.
 - **Testnet Ready**: Mendukung mode `testnet` untuk pengujian strategi dengan uang virtual sebelum terjun ke pasar riil (`production`).
 
 ## ⚠️ Disclaimer
@@ -103,8 +104,11 @@ ENVIRONMENT=testnet
 | `TRAILING_STOP_PCT` | `0.01` | Jarak trailing stop dari peak price (1% = 0.01) |
 | `DB_PATH` | `binance_bot.db` | Path database SQLite untuk state recovery |
 | `API_TIMEOUT` | `10` | Timeout koneksi REST API dalam detik |
-| `ORDER_CONFIRM_TIMEOUT` | `30` | Detik polling order fill via `/api/v3/orders` (0 = disable confirmation) |
+| `ORDER_CONFIRM_TIMEOUT` | `30` | Detik polling order fill via `/api/v3/orders` (1s interval, exponential backoff) |
 | `SL_FALLBACK_INTERVAL` | `30` | Interval pengecekan SL via REST (detik, 0 = matikan) |
+| `TELEGRAM_BOT_TOKEN` | — | Token bot dari @BotFather (kosong = disable) |
+| `TELEGRAM_CHAT_IDS` | — | Chat ID tujuan (comma-separated, kosong = disable) |
+| `TELEGRAM_NOTIFY_ERRORS` | `true` | Kirim notifikasi error ke Telegram |
 
 ### Cara Mendapatkan API Key Binance
 
@@ -114,6 +118,33 @@ ENVIRONMENT=testnet
 4. **Aktifkan hanya "Spot Trading"** (nonaktifkan Withdraw)
 5. Simpan API Key dan Secret dengan aman
 6. Untuk testnet, daftarkan di [Binance Spot Testnet](https://testnet.binance.vision/)
+
+### 📱 Setup Notifikasi Telegram
+
+Notifikasi dikirim secara *real-time* ke Telegram Anda:
+- **🟢 BUY** — harga entry, qty, order ID
+- **🔴 SELL (SL)** — harga exit, persentase loss
+- **🟡 SELL (TP)** — harga exit, persentase profit
+- **🟠 Partial TP / Trailing Stop** — detail sebagian posisi
+- **🔴 Max Drawdown** — force close alert
+- **⚡ WS Disconnect** — peringatan reconnect
+- **🔄 Reconcile** — hasil sinkronisasi setelah restart
+- **❌ Error** — semua exception yang terjadi
+
+**Langkah setup:**
+
+1. Buka [@BotFather](https://t.me/BotFather) di Telegram → ketik `/newbot` → beri nama → simpan TOKEN
+2. Cari bot Anda → klik **Start**
+3. Dapatkan Chat ID dengan cara:
+   - Kunjungi `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   - Cari `"from":{"id":XXXXXXX}` → ambil angkanya
+   - Atau kirim pesan ke bot Anda, lalu cek URL tersebut
+4. Isi `.env`:
+   ```ini
+   TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+   TELEGRAM_CHAT_IDS=123456789
+   # Untuk multi-chat: TELEGRAM_CHAT_IDS=123456789,987654321
+   ```
 
 ## ▶️ Menjalankan Bot
 

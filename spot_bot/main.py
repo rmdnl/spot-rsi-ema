@@ -56,6 +56,11 @@ def main():
         for t in threads:
             t.join()
 
+    # Notify Telegram about startup
+    env = os.getenv("ENVIRONMENT", "testnet")
+    if bots and bots[0].notifier:
+        bots[0].notifier.start(symbols=symbols, env=env)
+
     try:
         for bot in bots:
             bot.start_sl_fallback()
@@ -64,10 +69,14 @@ def main():
         for bot in bots:
             bot.shutdown()
         logging.info("Bot dihentikan secara manual (Ctrl+C).")
+        if bots and bots[0].notifier:
+            bots[0].notifier.shutdown("manual (Ctrl+C)")
     except Exception as e:
         for bot in bots:
             bot.shutdown()
         logging.error("Bot berhenti karena error fatal: %s", str(e))
+        if bots and bots[0].notifier:
+            bots[0].notifier.error(f"Fatal error: {e}")
 
 
 if __name__ == "__main__":
