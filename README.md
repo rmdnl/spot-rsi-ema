@@ -12,7 +12,14 @@ Bot ini dirancang agar ringan, responsif (menggunakan WebSocket), dan aman dari 
 - **State Recovery (SQLite)**: Mengingat status *trading* (apakah sedang memegang posisi koin dan berapa harga belinya) ke dalam database lokal `binance_bot.db`. Bot tidak akan kehilangan arah meski di-*restart*.
 - **Auto Precision Filter**: Otomatis menyesuaikan harga dan jumlah order (*Lot Size* & *Tick Size*) dengan aturan ketat Binance agar order tidak ditolak (termasuk *Min Notional*).
 - **SL Fallback Thread**: Thread terpisah yang memeriksa SL/TP via REST API setiap interval tertentu sebagai cadangan apabila WebSocket terputus.
-- **Thread-Safe State**: Akses ke状态 posisi (`in_position`, `entry_price`) dilindungi dengan `threading.Lock()` untuk mencegah race condition antara thread WSS dan fallback.
+- **Thread-Safe State**: Akses ke posisi (`in_position`, `entry_price`) dilindungi dengan `threading.Lock()` untuk mencegah race condition antara thread WSS dan fallback.
+- **Pending Sell Guard**: Mencegah double-sell dengan menandai order jual yang sedang diproses.
+- **Max Drawdown Cap**: Menutup posisi otomatis jika kerugian melebihi threshold (default 10%).
+- **Partial Take Profit**: Menjual separuh posisi di target profit pertama, sisanya mengikuti trailing stop.
+- **Trailing Stop**: Stop dinamis yang mengikuti harga tertinggi sejak entry, lock profit saat koreksi.
+- **Exchange Reconciliation**: Memverifikasi state DB dengan open orders riil di exchange setelah restart.
+- **Rate Limiter**: Token-bucket limiter mencegah ban dari Binance (1200 req/min).
+- **Multi-Symbol Support**: Bisa trading banyak pasangan sekaligus (`SYMBOLS=BTCUSDT,ETHUSDT`).
 - **Testnet Ready**: Mendukung mode `testnet` untuk pengujian strategi dengan uang virtual sebelum terjun ke pasar riil (`production`).
 
 ## ⚠️ Disclaimer
@@ -80,7 +87,7 @@ ENVIRONMENT=testnet
 | `BINANCE_API_KEY` | — | API Key dari [Binance API Management](https://www.binance.com/en/my/settings/api-management) |
 | `BINANCE_API_SECRET` | — | API Secret yang sesuai |
 | `ENVIRONMENT` | `testnet` | `testnet` untuk uji coba, `production` untuk pasar riil |
-| `SYMBOL` | `BTCUSDT` | Pasangan trading (contoh: `ETHUSDT`, `BNBUSDT`) |
+| `SYMBOLS` | `BTCUSDT` | Pasangan trading comma-separated (contoh: `BTCUSDT,ETHUSDT,SOLUSDT`) |
 | `TRADE_QTY` | `0.005` | Jumlah koin per order (pastikan nilai > $10 setelah dikalikan harga) |
 | `TIMEFRAME` | `15m` | Interval candlestick (1m, 5m, 15m, 1h, 4h, 1d) |
 | `RSI_PERIOD` | `14` | Periode perhitungan RSI |
@@ -88,6 +95,10 @@ ENVIRONMENT=testnet
 | `OVERSOLD` | `30` | Threshold RSI untuk sinyal Buy |
 | `OVERBOUGHT` | `70` | Threshold RSI untuk sinyal Sell/TP |
 | `STOP_LOSS_PCT` | `0.02` | Persentase Stop Loss (2% = 0.02) |
+| `MAX_DRAWDOWN_PCT` | `0.10` | Force close jika loss > 10% dari entry (proteksi black swan) |
+| `USE_PARTIAL_TP` | `true` | Jual separuh posisi di TP target, sisanya trailing stop |
+| `PARTIAL_TP_RATIO` | `0.5` | Rasio partial sell (0.5 = 50%) |
+| `TRAILING_STOP_PCT` | `0.01` | Jarak trailing stop dari peak price (1% = 0.01) |
 | `DB_PATH` | `binance_bot.db` | Path database SQLite untuk state recovery |
 | `API_TIMEOUT` | `10` | Timeout koneksi REST API dalam detik |
 | `SL_FALLBACK_INTERVAL` | `30` | Interval pengecekan SL via REST (detik, 0 = matikan) |
@@ -143,15 +154,29 @@ Sebelum menggunakan dana riil, **wajib** menguji di Binance Testnet:
                       |
                       |   HOLD POSISI
                       |
-        ┌─────────────┼──────────────┐
-        |             |              |
-   Harga ≤ SL      RSI >         WS disconnected
-   (2%) OVERBOUGHT    (70)
-        |             |              |
-      SELL          SELL          Fallback SL/TP
-                     |           check every 30s
-                   State reset
+        ┌─────────────┼──────────────────┐
+        |             |                  |
+   Harga <= SL     Harga >= TP Target   WS disconnected
+   (2%)       + RSI > OVERBOUGHT          |
+        |             |              Fallback SL (REST)
+      SELL        ┌─────┐               check every 30s
+                 | Half|  ->  Sisanya
+                 |Sell |     Trailing Stop
+                 └─────┘
+                     |
+                 Max Drawdown?
+                     |
+              Force Close ALL
 ```
+
+**Flow Penjualan:**
+1. **Stop Loss** -- harga turun 2% dari entry -> market sell seluruh posisi
+2. **Take Profit** -- harga naik 4% (2x SL) DAN RSI > 70:
+   - Jika `USE_PARTIAL_TP=true`: jual 50% di target, sisa ikuti trailing stop
+   - Jika `USE_PARTIAL_TP=false`: jual seluruh posisi
+3. **Trailing Stop** -- setiap harga baru record peak, kalau turun 1% dari peak -> sell sisa posisi
+4. **Max Drawdown** -- jika loss > 10% dari entry -> force close semua
+5. **Fallback** -- jika WebSocket putus, thread REST tetap cek SL tiap 30 detik
 
 ## 📊 Logging
 
@@ -166,11 +191,13 @@ Level logging tersedia: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 
 ## ⚠️ Peringatan Penting
 
-1. **Gunakan Testnet Dulu**: Selalu uji strategi di testnet sebelum menggunakan dana riil.
-2. **Keamanan API Key**: Jangan pernah commits `.env` ke repository. Gunakan `.gitignore` yang sudah dikonfigurasi.
-3. **Risk Management**: Sesuaikan `STOP_LOSS_PCT` dan `TRADE_QTY` dengan profil risiko Anda.
-4. **Monitor Bot**: Bot ini tidak memiliki alerting. Pantau log secara berkala.
-5. **WebSocket Disconnect**: Bot memiliki mekanisme reconnect otomatis, namun pastikan koneksi internet stabil.
+1. **Gunakan Testnet Dulu**: Selalu uji strategi di testnet minimal 1 minggu sebelum production.
+2. **Keamanan API Key**: Jangan pernah commit `.env` ke repository. `.env` sudah ada di `.gitignore`.
+3. **Risk Management**: Atur `STOP_LOSS_PCT`, `MAX_DRAWDOWN_PCT`, dan `TRADE_QTY` sesuai profil risiko Anda.
+4. **Monitor Bot**: Bot ini tidak memiliki alerting eksternal. Pantau log dan cek posisi secara berkala.
+5. **WebSocket Disconnect**: Bot auto-reconnect, tapi fallback thread juga menyediakan SL via REST.
+6. **Reconciliation**: Setelah crash/restart, bot akan otomatis sync dengan open orders di exchange.
+7. **Multi-Symbol**: Jika pakai banyak koin, pastikan total modal cukup untuk semua posisi (min notional per pair).
 
 ## 🔧 Troubleshooting
 
@@ -181,6 +208,8 @@ Level logging tersedia: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 | WebSocket sering disconnect | Koneksi tidak stabil / firewall | Tidak ada masalah kritis; bot auto-reconnect |
 | Double sell setelah restart | State DB tidak sinkron dengan exchange | Restart bot, cek posisi riil di dashboard Binance |
 | Bot tidak eksekusi BUY | RSI > OVERSOLD atau Harga < EMA | Tunggu kondisi terpenuhi, atau ubah threshold di `.env` |
+| Double sell setelah restart | State DB tidak sinkron dengan exchange | Bot akan auto-reconcile, atau cek manual di dashboard Binance |
+| Order ditolak rate limit | Terlalu banyak request REST | Rate limiter sudah aktif; kurangi `SL_FALLBACK_INTERVAL` |
 
 ## 🛡️ Keamanan
 
