@@ -240,9 +240,8 @@ Level logging tersedia: `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 | Error "API Key atau Secret tidak ditemukan" | `.env` belum dibuat/diisi | Copy `.env.example` jadi `.env` dan isi kredensial |
 | Order ditolak "MIN_NOTIONAL" | `TRADE_QTY * price` < batas minimum Binance | Naikkan `TRADE_QTY` atau pilih koin dengan harga lebih tinggi |
 | WebSocket sering disconnect | Koneksi tidak stabil / firewall | Tidak ada masalah kritis; bot auto-reconnect |
-| Double sell setelah restart | State DB tidak sinkron dengan exchange | Restart bot, cek posisi riil di dashboard Binance |
+| Double sell setelah restart | State DB tidak sinkron dengan exchange | Bot akan auto-reconcile saat start, atau cek manual di dashboard Binance |
 | Bot tidak eksekusi BUY | RSI > OVERSOLD atau Harga < EMA | Tunggu kondisi terpenuhi, atau ubah threshold di `.env` |
-| Double sell setelah restart | State DB tidak sinkron dengan exchange | Bot akan auto-reconcile, atau cek manual di dashboard Binance |
 | Order ditolak rate limit | Terlalu banyak request REST | Rate limiter sudah aktif; kurangi `SL_FALLBACK_INTERVAL` |
 
 ## 🛡️ Keamanan

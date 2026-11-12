@@ -137,7 +137,6 @@ class RSIEngine:
                 )
             else:
                 self.logger.info("Tidak ada state sebelumnya di DB. Memulai dari kondisi awal.")
-            conn.close()
             # Reconcile dengan exchange untuk memastikan state sinkron
             if self.in_position:
                 self.reconcile_with_exchange()
@@ -462,21 +461,13 @@ class RSIEngine:
         try:
             self.api.create_order(symbol=self.symbol, side="SELL", type="MARKET", quantity=qty)
             self.logger.info("SELL (%s) Eksekusi di ~%.8f qty=%.8f.", reason, current_price, qty)
+            # Capture entry BEFORE clearing so notification has correct profit/loss %
+            prev_entry = self.entry_price_val
             self.clear_position()
             self.save_state_to_db()
             # Notify Telegram with contextual info
             if self.notifier:
-                entry = self.entry_price_val  # already cleared, but saved to DB before; use last known
-                # Recompute from DB as fallback
-                try:
-                    conn = sqlite3.connect(self.db_path)
-                    row = conn.execute(
-                        "SELECT entry_price FROM bot_state WHERE symbol=?", (self.symbol,)
-                    ).fetchone()
-                    conn.close()
-                    entry = float(row[0]) if row else 0.0
-                except Exception:
-                    pass
+                entry = prev_entry
                 pct_change = ((current_price - entry) / entry * 100) if entry > 0 else 0.0
                 self.notifier.sell(
                     self.symbol, current_price, reason,
