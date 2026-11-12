@@ -42,6 +42,7 @@ class RSIEngine:
         db_path: str = "binance_bot.db",
         api_timeout: int = 10,
         sl_fallback_interval: int = 30,
+        order_confirm_timeout: int = 30,
     ):
         self.api = api_client
         self.symbol = symbol.upper()
@@ -53,7 +54,9 @@ class RSIEngine:
         self.overbought = overbought
         self.stop_loss_pct = stop_loss_pct
         self.db_path = db_path
+        self.api_timeout = api_timeout
         self.sl_fallback_interval = sl_fallback_interval
+        self.order_confirm_timeout = order_confirm_timeout
         self.max_drawdown_pct = float(os.getenv("MAX_DRAWDOWN_PCT", "0.10"))
         self.use_partial_tp = os.getenv("USE_PARTIAL_TP", "true").lower() == "true"
         self.partial_tp_ratio = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))
@@ -265,6 +268,54 @@ class RSIEngine:
             self.in_position = False
             self.entry_price = 0.0
 
+    def _balance_check(self, min_quote: float) -> bool:
+        """Return True when USDT balance >= min_quote. False otherwise."""
+        try:
+            acct = self.api.get_account_balance()
+            for bal in acct.get("balances", []):
+                if bal["asset"] == "USDT":
+                    free = float(bal["free"])
+                    return free >= min_quote
+            return False
+        except Exception:
+            self.logger.error("Gagal cek saldo, asumsikan cukup.", exc_info=True)
+            return True
+
+    def _wait_for_fill(self, order_id: int, timeout_s: int = 30) -> float | None:
+        """Poll Binance /api/v3/orders until order is FILLED or rejected/cancelled.
+
+        Returns fill (avgPrice) on success, None on failure/timeout.
+        """
+        deadline = time.monotonic() + timeout_s
+        poll_interval = 0.5  # seconds between polls
+        poll_count = 0
+        while time.monotonic() < deadline:
+            poll_count += 1
+            time.sleep(poll_interval)
+            try:
+                resp = self.api.get_order(self.symbol, order_id)
+                status = resp.get("status", "")
+                if status == "FILLED":
+                    avg_price = float(resp.get("fills", [{}])[0].get("price", 0) or resp.get("avgPrice", 0))
+                    self.logger.info(
+                        "Order #%d FILLED — avgPrice=%.8f (poll #%d)",
+                        order_id, avg_price, poll_count,
+                    )
+                    return avg_price
+                elif status in ("REJECTED", "CANCELED", "EXPIRED"):
+                    self.logger.warning(
+                        "Order #%d %s — aborting position set. Response: %s",
+                        order_id, status, {k: resp[k] for k in ("status", "side") if k in resp},
+                    )
+                    return None
+                # PENDING — keep polling
+            except Exception:
+                self.logger.debug(
+                    "Order #%d poll #%d failed, retrying...", order_id, poll_count, exc_info=True,
+                )
+        self.logger.error("Order #%d tidak terisi dalam %ds (%d polls). Aborting.", order_id, timeout_s, poll_count)
+        return None
+
     # -- Core logic ----------------------------------------------------------
 
     def execute_logic(self, current_price: float, current_rsi: float, current_ema: float):
@@ -298,12 +349,41 @@ class RSIEngine:
 
             self.logger.info("Sinyal BUY (RSI=%.2f & Harga > EMA).", current_rsi)
             try:
-                self.api.create_order(symbol=self.symbol, side="BUY", type="MARKET", quantity=qty)
-                self.set_entry(current_price)
+                # Pre-flight: cek saldo USDT cukup (> min_notional)
+                if not self._balance_check(self.min_notional):
+                    self.logger.warning(
+                        "Saldo USDT tidak cukup untuk buy. Skip. (min_notional=%.2f)",
+                        self.min_notional,
+                    )
+                    return
+
+                resp = self.api.create_order(
+                    symbol=self.symbol, side="BUY", type="MARKET", quantity=qty
+                )
+                order_id = int(resp.get("orderId", 0))
+                if order_id <= 0:
+                    self.logger.error(
+                        "Response BUY tanpa orderId — order status tidak pasti. Response: %s",
+                        {k: resp[k] for k in ("status", "side", "type") if k in resp},
+                    )
+                    return
+
+                fill_price = self._wait_for_fill(order_id, timeout_s=self.order_confirm_timeout)
+                if fill_price is None:
+                    self.logger.error(
+                        "Order #%d tidak terisi dalam 30 detik. Biarkan fallback SL thread tangani.",
+                        order_id,
+                    )
+                    return
+
+                self.set_entry(fill_price)
                 self.save_state_to_db()
-                self.logger.info("BUY Eksekusi di ~%.8f. Tersimpan di DB.", current_price)
+                self.logger.info(
+                    "BUY CONFIRMED — orderId=%d, avgPrice=%.8f qty=%.8f",
+                    order_id, fill_price, qty,
+                )
             except Exception:
-                self.logger.error("Gagal BUY", exc_info=True)
+                self.logger.error("Gagal BUY atau konfirmasi gagal", exc_info=True)
 
         elif self.is_in_position:
             loss_threshold = self.entry_price_val * (1.0 - self.stop_loss_pct)

@@ -120,8 +120,15 @@ class SpotAPI:
             params["timeInForce"] = "GTC"
         return self._request("POST", "/api/v3/order", params=params, signed=True)
 
+    def get_account_balance(self) -> dict:
+        return self._request("GET", "/api/v3/account", signed=True)
+
     def get_open_orders(self, symbol: str) -> list:
         return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol})
 
-    def get_account_balance(self) -> dict:
-        return self._request("GET", "/api/v3/account", signed=True)
+    def get_order(self, symbol: str, order_id: int) -> dict:
+        return self._request(
+            "GET", "/api/v3/order",
+            params={"symbol": symbol, "orderId": order_id},
+            signed=True,
+        )

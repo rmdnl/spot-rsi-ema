@@ -42,6 +42,7 @@ def main():
             stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.02")),
             db_path=os.getenv("DB_PATH", "binance_bot.db"),
             sl_fallback_interval=int(os.getenv("SL_FALLBACK_INTERVAL", "30")),
+            order_confirm_timeout=int(os.getenv("ORDER_CONFIRM_TIMEOUT", "30")),
         )
         bots.append(b)
         logging.info("Bot untuk %s siap.", sym)

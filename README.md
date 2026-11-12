@@ -14,6 +14,8 @@ Bot ini dirancang agar ringan, responsif (menggunakan WebSocket), dan aman dari 
 - **SL Fallback Thread**: Thread terpisah yang memeriksa SL/TP via REST API setiap interval tertentu sebagai cadangan apabila WebSocket terputus.
 - **Thread-Safe State**: Akses ke posisi (`in_position`, `entry_price`) dilindungi dengan `threading.Lock()` untuk mencegah race condition antara thread WSS dan fallback.
 - **Pending Sell Guard**: Mencegah double-sell dengan menandai order jual yang sedang diproses.
+- **Order Confirmation Loop**: Menunggu konfirmasi fill dari Binance (`/api/v3/orders`) sebelum set posisi, mencegah state corruption jika order ditolak.
+- **USDT Balance Check**: Cek saldo USDT pre-flight sebelum submit BUY, menghindari rejection insufficient funds.
 - **Max Drawdown Cap**: Menutup posisi otomatis jika kerugian melebihi threshold (default 10%).
 - **Partial Take Profit**: Menjual separuh posisi di target profit pertama, sisanya mengikuti trailing stop.
 - **Trailing Stop**: Stop dinamis yang mengikuti harga tertinggi sejak entry, lock profit saat koreksi.
@@ -101,6 +103,7 @@ ENVIRONMENT=testnet
 | `TRAILING_STOP_PCT` | `0.01` | Jarak trailing stop dari peak price (1% = 0.01) |
 | `DB_PATH` | `binance_bot.db` | Path database SQLite untuk state recovery |
 | `API_TIMEOUT` | `10` | Timeout koneksi REST API dalam detik |
+| `ORDER_CONFIRM_TIMEOUT` | `30` | Detik polling order fill via `/api/v3/orders` (0 = disable confirmation) |
 | `SL_FALLBACK_INTERVAL` | `30` | Interval pengecekan SL via REST (detik, 0 = matikan) |
 
 ### Cara Mendapatkan API Key Binance
