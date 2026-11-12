@@ -124,7 +124,7 @@ class SpotAPI:
         return self._request("GET", "/api/v3/account", signed=True)
 
     def get_open_orders(self, symbol: str) -> list:
-        return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol})
+        return self._request("GET", "/api/v3/openOrders", params={"symbol": symbol}, signed=True)
 
     def get_order(self, symbol: str, order_id: int) -> dict:
         return self._request(

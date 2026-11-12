@@ -282,13 +282,15 @@ class RSIEngine:
             return True
 
     def _wait_for_fill(self, order_id: int, timeout_s: int = 30) -> float | None:
-        """Poll Binance /api/v3/orders until order is FILLED or rejected/cancelled.
+        """Poll Binance /api/v3/order until order is FILLED or rejected/cancelled.
 
-        Returns fill (avgPrice) on success, None on failure/timeout.
+        Returns fill price (avgPrice) on success, None on failure/timeout.
+        Uses exponential backoff on errors to respect rate limits.
         """
         deadline = time.monotonic() + timeout_s
-        poll_interval = 0.5  # seconds between polls
+        poll_interval = 1.0  # seconds between polls (rate limit friendly)
         poll_count = 0
+        consecutive_errors = 0
         while time.monotonic() < deadline:
             poll_count += 1
             time.sleep(poll_interval)
@@ -296,7 +298,12 @@ class RSIEngine:
                 resp = self.api.get_order(self.symbol, order_id)
                 status = resp.get("status", "")
                 if status == "FILLED":
-                    avg_price = float(resp.get("fills", [{}])[0].get("price", 0) or resp.get("avgPrice", 0))
+                    avg_price = float(resp.get("avgPrice", 0) or 0)
+                    # Fallback to fills array if avgPrice not present
+                    if avg_price == 0:
+                        fills = resp.get("fills", [])
+                        if fills:
+                            avg_price = float(fills[0].get("price", 0))
                     self.logger.info(
                         "Order #%d FILLED — avgPrice=%.8f (poll #%d)",
                         order_id, avg_price, poll_count,
@@ -304,15 +311,26 @@ class RSIEngine:
                     return avg_price
                 elif status in ("REJECTED", "CANCELED", "EXPIRED"):
                     self.logger.warning(
-                        "Order #%d %s — aborting position set. Response: %s",
-                        order_id, status, {k: resp[k] for k in ("status", "side") if k in resp},
+                        "Order #%d %s — aborting position set.",
+                        order_id, status,
                     )
                     return None
-                # PENDING — keep polling
+                elif status == "PARTIALLY_FILLED":
+                    # Market orders rarely partial-fill; continue polling for full fill
+                    self.logger.debug(
+                        "Order #%d PARTIALLY_FILLED — continuing wait...", order_id,
+                    )
+                # PENDING — keep polling, reset error counter
+                consecutive_errors = 0
             except Exception:
+                consecutive_errors += 1
+                # Exponential backoff: 1s → 2s → 4s max
+                backoff = min(poll_interval * (2 ** consecutive_errors), 8.0)
                 self.logger.debug(
-                    "Order #%d poll #%d failed, retrying...", order_id, poll_count, exc_info=True,
+                    "Order #%d poll #%d failed (%ds backoff)...", order_id, poll_count, backoff,
+                    exc_info=True,
                 )
+                time.sleep(backoff - poll_interval)  # extra sleep for backoff
         self.logger.error("Order #%d tidak terisi dalam %ds (%d polls). Aborting.", order_id, timeout_s, poll_count)
         return None
 
