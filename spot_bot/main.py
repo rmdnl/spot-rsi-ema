@@ -43,6 +43,8 @@ def main():
             db_path=os.getenv("DB_PATH", "binance_bot.db"),
             sl_fallback_interval=int(os.getenv("SL_FALLBACK_INTERVAL", "30")),
             order_confirm_timeout=int(os.getenv("ORDER_CONFIRM_TIMEOUT", "30")),
+            volume_filter=os.getenv("VOLUME_FILTER", "false").lower() == "true",
+            volume_mult=float(os.getenv("VOLUME_MULT", "1.5")),
         )
         bots.append(b)
         logging.info("Bot untuk %s siap.", sym)

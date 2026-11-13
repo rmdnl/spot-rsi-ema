@@ -45,6 +45,8 @@ class RSIEngine:
         api_timeout: int = 10,
         sl_fallback_interval: int = 30,
         order_confirm_timeout: int = 30,
+        volume_filter: bool = False,
+        volume_mult: float = 1.5,
     ):
         self.api = api_client
         self.symbol = symbol.upper()
@@ -63,6 +65,9 @@ class RSIEngine:
         self.use_partial_tp = os.getenv("USE_PARTIAL_TP", "true").lower() == "true"
         self.partial_tp_ratio = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))
         self.trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT", "0.01"))
+        # P1: Volume spike filter — skip entries when volume < mult × avg(20)
+        self.volume_filter = os.getenv("VOLUME_FILTER", "false").lower() == "true" if volume_filter is None else volume_filter
+        self.volume_mult = float(os.getenv("VOLUME_MULT", str(volume_mult)))
 
         self.in_position = False
         self.entry_price = 0.0
@@ -70,6 +75,7 @@ class RSIEngine:
         self.pending_sell = False             # order sudah dikirim tapi belum dikonfirmasi filled
 
         self.klines_data = []
+        self.volumes_data: list[float] = []  # P1: rolling volumes for volume-filter
 
         self.price_precision = 2
         self.qty_precision = 5
@@ -293,6 +299,18 @@ class RSIEngine:
             self.logger.error("Gagal cek saldo, asumsikan cukup.", exc_info=True)
             return True
 
+    def _check_volume(self, current_vol: float) -> bool:
+        """P1: Return True when current_vol >= mult × avg(volume, 20 bars).
+
+        If not enough history or filter disabled, always returns True.
+        """
+        if not self.volume_filter:
+            return True
+        if len(self.volumes_data) < 20 or current_vol <= 0:
+            return True
+        avg = sum(self.volumes_data[-20:]) / 20
+        return current_vol >= avg * self.volume_mult
+
     def _wait_for_fill(self, order_id: int, timeout_s: int = 30) -> float | None:
         """Poll Binance /api/v3/order until order is FILLED or rejected/cancelled.
 
@@ -348,7 +366,7 @@ class RSIEngine:
 
     # -- Core logic ----------------------------------------------------------
 
-    def execute_logic(self, current_price: float, current_rsi: float, current_ema: float):
+    def execute_logic(self, current_price: float, current_rsi: float, current_ema: float, current_vol: float = 0.0):
         qty = self.format_qty(self.trade_qty)
         if qty <= 0:
             self.logger.error("format_qty returned 0 — skip order to avoid rejection.")
@@ -367,6 +385,15 @@ class RSIEngine:
                 return
 
         if current_rsi < self.oversold and current_price > current_ema and not self.is_in_position:
+            # P1: Volume spike filter — skip low-volume entries
+            if not self._check_volume(current_vol):
+                self.logger.debug(
+                    "Volume filter skip: vol=%.2f avg20=%.2f mult=%.1fx",
+                    current_vol,
+                    sum(self.volumes_data[-20:]) / 20 if len(self.volumes_data) >= 20 else 0,
+                    self.volume_mult,
+                )
+                return
             required_qty = self.min_notional / current_price if current_price > 0 else float("inf")
             qty = max(qty, self.format_qty(required_qty))
 
@@ -497,11 +524,15 @@ class RSIEngine:
 
         close_price = float(kline["c"])
         is_closed = kline["x"]
+        current_vol = float(kline.get("v", 0))  # P1: volume from kline
 
         if is_closed:
             self.klines_data.append(close_price)
             if len(self.klines_data) > 500:
                 self.klines_data.pop(0)
+            self.volumes_data.append(current_vol)   # P1: store closed-candle volume
+            if len(self.volumes_data) > 500:
+                self.volumes_data.pop(0)
 
         temp_closes = list(self.klines_data) + [close_price]
         current_rsi = self.calculate_rsi(temp_closes)
@@ -513,7 +544,7 @@ class RSIEngine:
                     "[%s] Harga: %.2f | RSI: %.2f | EMA%d: %.2f",
                     self.symbol, close_price, current_rsi, self.ema_period, current_ema,
                 )
-            self.execute_logic(close_price, current_rsi, current_ema)
+            self.execute_logic(close_price, current_rsi, current_ema, current_vol=current_vol)
 
     def on_error(self, ws, error):
         self.logger.error("WebSocket Error: %s", error)

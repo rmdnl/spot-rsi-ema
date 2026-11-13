@@ -104,6 +104,8 @@ terus edit `.env` dan isi API key Binance lo. Jangan lupa set `ENVIRONMENT=testn
 | `TELEGRAM_BOT_TOKEN` | — | Token bot dari @BotFather (kosong = off) |
 | `TELEGRAM_CHAT_IDS` | — | Chat ID tujuan (comma-sep, kosong = off) |
 | `TELEGRAM_NOTIFY_ERRORS` | `true` | Kirim notif error ke Telegram |
+| `VOLUME_FILTER` | `false` | **P1**: Skip entry kalau volume < threshold (butuh background research dulu) |
+| `VOLUME_MULT` | `1.5` | Multiplier volume spike (default 1.5× rata-rata 20 bar) |
 
 ## 🔑 Cara Nyari API Key Binance
 
