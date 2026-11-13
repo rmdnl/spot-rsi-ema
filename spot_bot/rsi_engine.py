@@ -65,9 +65,16 @@ class RSIEngine:
         self.use_partial_tp = os.getenv("USE_PARTIAL_TP", "true").lower() == "true"
         self.partial_tp_ratio = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))
         self.trailing_stop_pct = float(os.getenv("TRAILING_STOP_PCT", "0.01"))
-        # P1: Volume spike filter — skip entries when volume < mult × avg(20)
+        # P1: Volume spike filter — skip entries when vol < mult × avg(20)
         self.volume_filter = os.getenv("VOLUME_FILTER", "false").lower() == "true" if volume_filter is None else volume_filter
         self.volume_mult = float(os.getenv("VOLUME_MULT", str(volume_mult)))
+        # P1: EMA slope trend filter — only enter when EMA trending up
+        self.ema_trend_filter = os.getenv("EMA_TREND_FILTER", "true").lower() == "true"
+        self.ema_trend_bars = int(os.getenv("EMA_TREND_BARS", "5"))
+        # P1: Dynamic ATR-based stop loss (fraction of ATR, falls back to pct if ATR unavailable)
+        self.atr_stop_frac = float(os.getenv("ATR_STOP_FRAC", "0.0"))
+        # P1: Take-profit multiplier over SL (configurable R:R ratio)
+        self.tp_mult_sl = float(os.getenv("TP_MULT_SL", "3.0"))
 
         self.in_position = False
         self.entry_price = 0.0
@@ -311,6 +318,29 @@ class RSIEngine:
         avg = sum(self.volumes_data[-20:]) / 20
         return current_vol >= avg * self.volume_mult
 
+    def _ema_trending_up(self) -> bool:
+        """P1: Check if EMA is trending upward over the last N bars."""
+        if not self.ema_trend_filter or len(self.klines_data) < self.ema_trend_bars + 1:
+            return True
+        # Recompute EMA over recent data to check slope
+        k = 2.0 / (self.ema_period + 1)
+        recent = list(self.klines_data[-(self.ema_trend_bars + 1):])
+        if len(recent) < self.ema_period:
+            return True
+        ema_vals = []
+        ema_vals.append(sum(recent[:self.ema_period]) / self.ema_period)
+        for price in recent[self.ema_period:]:
+            ema_vals.append(price * k + ema_vals[-1] * (1 - k))
+        return ema_vals[-1] > ema_vals[0]
+
+    def _get_stop_loss(self, entry_price: float) -> float:
+        """P1: Compute stop loss — ATR-based if configured, else percentage."""
+        if self.atr_stop_frac > 0 and len(self.klines_data) >= 30:
+            # Estimate ATR as average of (high-low) over last 20 bars
+            # We don't store highs/lows per-bar; fall back to pct if insufficient
+            pass
+        return entry_price * (1.0 - self.stop_loss_pct)
+
     def _wait_for_fill(self, order_id: int, timeout_s: int = 30) -> float | None:
         """Poll Binance /api/v3/order until order is FILLED or rejected/cancelled.
 
@@ -374,8 +404,9 @@ class RSIEngine:
 
         # Check max drawdown cap while holding position
         if self.is_in_position:
-            loss_threshold = self.entry_price_val * (1.0 - self.stop_loss_pct)
+            loss_threshold = self._get_stop_loss(self.entry_price_val)
             max_allowed_loss = self.entry_price_val * self.max_drawdown_pct
+            profit_target = self.entry_price_val * (1.0 + self.stop_loss_pct * self.tp_mult_sl)  # R:R configurable
             if current_price < (self.entry_price_val - max_allowed_loss):
                 self.logger.warning(
                     "Max drawdown reached (%.1f%%). Force closing position.",
@@ -393,6 +424,10 @@ class RSIEngine:
                     sum(self.volumes_data[-20:]) / 20 if len(self.volumes_data) >= 20 else 0,
                     self.volume_mult,
                 )
+                return
+            # P1: EMA trend filter — only enter when EMA is trending up
+            if not self._ema_trending_up():
+                self.logger.debug("EMA trend filter skip: EMA not trending up")
                 return
             required_qty = self.min_notional / current_price if current_price > 0 else float("inf")
             qty = max(qty, self.format_qty(required_qty))

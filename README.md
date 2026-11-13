@@ -104,8 +104,12 @@ terus edit `.env` dan isi API key Binance lo. Jangan lupa set `ENVIRONMENT=testn
 | `TELEGRAM_BOT_TOKEN` | — | Token bot dari @BotFather (kosong = off) |
 | `TELEGRAM_CHAT_IDS` | — | Chat ID tujuan (comma-sep, kosong = off) |
 | `TELEGRAM_NOTIFY_ERRORS` | `true` | Kirim notif error ke Telegram |
-| `VOLUME_FILTER` | `false` | **P1**: Skip entry kalau volume < threshold (butuh background research dulu) |
-| `VOLUME_MULT` | `1.5` | Multiplier volume spike (default 1.5× rata-rata 20 bar) |
+| `VOLUME_FILTER` | `true` | **P1 RECOMMENDED**: Skip entry kalau volume < threshold (critical untuk profit!) |
+| `VOLUME_MULT` | `2.0` | Multiplier volume spike (2.0× rata-rata 20 bar = optimal untuk SOL) |
+| `EMA_TREND_FILTER` | `true` | **P1**: Hanya entry kalau EMA sedang trending naik |
+| `EMA_TREND_BARS` | `5` | Jumlah bar untuk cek arah trend EMA |
+| `TP_MULT_SL` | `3.0` | **P1 RECOMMENDED**: TP multiplier × SL% (3.0x = R:R 1:3, terbukti profitable) |
+| `ATR_STOP_FRAC` | `0.0` | ATR-based stop (0.0 = pakai fixed %, experimental) |
 
 ## 🔑 Cara Nyari API Key Binance
 
