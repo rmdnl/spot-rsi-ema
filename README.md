@@ -1,12 +1,18 @@
 # Binance RSI Spot Bot 🚀🤖
 
-Bot trading otomatis buat pasar **Binance Spot** yang pake indikator **RSI** + **EMA** buat nyokong decision making lo. Gak perlu mikir manual — bot udah ngurus entry, exit, stop loss, sampe trailing stop. Ringan, cepet (WebSocket), dan gak punya amnesia (SQLite).
+Bot trading otomatis untuk pasar **Binance Spot** yang support **dua strategi**:
+- **Mode Default (1H Swing)** → EMA Ribbon Golden Cross (`8/21/55`) — profitable +46% sampai +83%/tahun
+- **Mode Scalping (<1H)** → RSI + EMA filter — untuk active scalper
+
+Gak perlu mikir manual, bot udah ngurus entry, exit, stop loss, sampe trailing stop. Ringan, cepet (WebSocket), dan gak punya amnesia (SQLite).
 
 Jadi kalau server lo crash atau listrik mati, bot bakal inget posisi terakhir lo pas nyala lagi. *No stress, no panic.* 😎
 
 ## ✨ Fitur-Fitur Keren
 
-- **Strategi RSI + EMA**: Buy pas harga *oversold* (RSI < 30) DAN tren lagi naik (Harga > EMA 200). Sell pas *overbought* (RSI > 70). Simple tapi effective, guaranteed.
+- **Strategi Dual Mode**: 
+  - **EMA Ribbon (default 1H)**: Buy pas golden cross (EMA_fast > EMA_med > EMA_slow), sell pas trend break. Backtest: **+46% s.d +83%** per tahun.
+  - **RSI+EMA (<1H)**: Buy pas RSI oversold (RSI < 30) DAN tren naik (Harga > EMA). Best: SOLUSDT 15m = **+5.43%** dengan volume filter.
 - **Stop Loss Otomatis**: Cut loss 2% auto eksekusi kalau pasar lagi *dump*. Modal lo aman, gak perlu WAGYU vibes.
 - **Real-Time WebSocket**: Harga update tiap detik via Binance WebSocket Stream. Gak pusing soal rate limit REST API.
 - **State Recovery (SQLite)**: Bot inget posisi lo pakai database lokal `binance_bot.db`. Restart sekalipun, tetap on point.
@@ -85,13 +91,13 @@ terus edit `.env` dan isi API key Binance lo. Jangan lupa set `ENVIRONMENT=testn
 | `BINANCE_API_KEY` | — | API Key dari [Binance API Management](https://www.binance.com/en/my/settings/api-management) |
 | `BINANCE_API_SECRET` | — | API Secret yang sesuai |
 | `ENVIRONMENT` | `testnet` | `testnet` = playground, `production` = uang beneran |
-| `SYMBOLS` | `BTCUSDT` | Pasangan trading comma-separated, contoh: `BTCUSDT,ETHUSDT,SOLUSDT` |
+| `SYMBOLS` | `SOLUSDT,NEARUSDT` | **Default 1H swing** — backtest terbaik. Scalping <1H pakai SOLUSDT aja |
 | `TRADE_QTY` | `0.005` | Jumlah koin per order (harusnya nilainya > $10 pas dikali harga) |
-| `TIMEFRAME` | `15m` | Interval candlestick (1m, 5m, 15m, 1h, 4h, 1d) |
-| `RSI_PERIOD` | `14` | Periode hitung RSI |
-| `EMA_PERIOD` | `200` | Periode hitung EMA |
-| `OVERSOLD` | `30` | Threshold RSI untuk sinyal Buy |
-| `OVERBOUGHT` | `70` | Threshold RSI untuk sinyal Sell/TP |
+| `TIMEFRAME` | `1h` | **Default: 1H** = EMA Ribbon Golden Cross swing trading. <1h otomatis RSI mode |
+| `RSI_PERIOD` | `14` | Periode hitung RSI (hanya dipakai di TIMEFRAME < 1h / mode RSI) |
+| `EMA_PERIOD` | `200` | Periode hitung EMA single (hanya dipakai di TIMEFRAME < 1h / mode RSI) |
+| `OVERSOLD` | `30` | Threshold RSI untuk sinyal Buy (hanya mode RSI / <1h) |
+| `OVERBOUGHT` | `70` | Threshold RSI untuk sinyal Sell/TP (hanya mode RSI / <1h) |
 | `STOP_LOSS_PCT` | `0.02` | Persentase Stop Loss (2% = 0.02) |
 | `MAX_DRAWDOWN_PCT` | `0.10` | Force close kalau loss > 10% dari entry (anti black swan) |
 | `USE_PARTIAL_TP` | `true` | Jual separuh posisi pas TP target, sisanya ikutan trailing stop |
@@ -104,16 +110,16 @@ terus edit `.env` dan isi API key Binance lo. Jangan lupa set `ENVIRONMENT=testn
 | `TELEGRAM_BOT_TOKEN` | — | Token bot dari @BotFather (kosong = off) |
 | `TELEGRAM_CHAT_IDS` | — | Chat ID tujuan (comma-sep, kosong = off) |
 | `TELEGRAM_NOTIFY_ERRORS` | `true` | Kirim notif error ke Telegram |
-| `VOLUME_FILTER` | `true` | **P1 RECOMMENDED**: Skip entry kalau volume < threshold (critical untuk profit!) |
-| `VOLUME_MULT` | `1.2` | **Active Scalping**: 1.2× rata-rata (lebih sering trade, ~20/tahun). Untuk konservatif pakai `2.0` |
+| `VOLUME_FILTER` | `false` | Default false — otomatis disabled saat mode ema_ribbon. Aktifkan hanya untuk scalping <1h |
+| `VOLUME_MULT` | `2.0` | Threshold multiplier volume spike (hanya aktif di mode RSI / <1h) |
 | `EMA_TREND_FILTER` | `true` | **P1**: Hanya entry kalau EMA sedang trending naik |
 | `EMA_TREND_BARS` | `5` | Jumlah bar untuk cek arah trend EMA |
 | `TP_MULT_SL` | `3.0` | **P1 RECOMMENDED**: TP multiplier × SL% (3.0x = R:R 1:3, terbukti profitable) |
 | `ATR_STOP_FRAC` | `0.0` | ATR-based stop (0.0 = pakai fixed %, experimental) |
-| `STRATEGY_MODE` | auto | **P2**: `rsi` = strategy lama, `ema_ribbon` = golden cross baru (auto-detect dari TIMEFRAME) |
-| `EMA_FAST` | `10` | Fast EMA untuk EMA Ribbon mode (default 10) |
-| `EMA_MED` | `30` | Medium EMA untuk EMA Ribbon mode (default 30) |
-| `EMA_SLOW` | `60` | Slow EMA untuk EMA Ribbon mode (default 60) |
+| `STRATEGY_MODE` | `ema_ribbon` | **DEFAULT**: EMA Ribbon Golden Cross untuk 1H swing (+46%~+83%). Pakai `rsi` buat scalping <1H |
+| `EMA_FAST` | `8` | Fast EMA — golden cross signal (optimal: 8/21/55 dari backtest) |
+| `EMA_MED` | `21` | Medium EMA — trend baseline |
+| `EMA_SLOW` | `55` | Slow EMA — trend confirmation |
 
 ## 🔑 Cara Nyari API Key Binance
 
