@@ -45,6 +45,10 @@ def main():
             order_confirm_timeout=int(os.getenv("ORDER_CONFIRM_TIMEOUT", "30")),
             volume_filter=os.getenv("VOLUME_FILTER", "false").lower() == "true",
             volume_mult=float(os.getenv("VOLUME_MULT", "1.5")),
+            ema_fast=int(os.getenv("EMA_FAST", "10")),
+            ema_med=int(os.getenv("EMA_MED", "30")),
+            ema_slow=int(os.getenv("EMA_SLOW", "60")),
+            strategy_mode=os.getenv("STRATEGY_MODE", None),
         )
         bots.append(b)
         logging.info("Bot untuk %s siap.", sym)

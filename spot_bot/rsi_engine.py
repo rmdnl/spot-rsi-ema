@@ -47,6 +47,11 @@ class RSIEngine:
         order_confirm_timeout: int = 30,
         volume_filter: bool = False,
         volume_mult: float = 1.5,
+        # P2: EMA Ribbon strategy (for 1H swing trading)
+        ema_fast: int = None,
+        ema_med: int = None,
+        ema_slow: int = None,
+        strategy_mode: str = None,  # 'rsi' or 'ema_ribbon' — auto-detected from TIMEFRAME if None
     ):
         self.api = api_client
         self.symbol = symbol.upper()
@@ -75,6 +80,26 @@ class RSIEngine:
         self.atr_stop_frac = float(os.getenv("ATR_STOP_FRAC", "0.0"))
         # P1: Take-profit multiplier over SL (configurable R:R ratio)
         self.tp_mult_sl = float(os.getenv("TP_MULT_SL", "3.0"))
+        # P2: EMA Ribbon strategy params
+        _mode_from_env = os.getenv("STRATEGY_MODE", strategy_mode or "").lower()
+        if _mode_from_env in ("ema_ribbon", "ema"):
+            self.strategy_mode = "ema_ribbon"
+        elif _mode_from_env in ("rsi",):
+            self.strategy_mode = "rsi"
+        else:
+            # Auto-detect: use ema_ribbon for 1h+ timeframes, rsi for shorter
+            tf = os.getenv("TIMEFRAME", timeframe).lower()
+            self.strategy_mode = "ema_ribbon" if any(tf.startswith(t) for t in ("1h", "4h", "1d")) else "rsi"
+        if self.strategy_mode == "ema_ribbon":
+            self.ema_fast = int(os.getenv("EMA_FAST", str(ema_fast or 10)))
+            self.ema_med = int(os.getenv("EMA_MED", str(ema_med or 30)))
+            self.ema_slow = int(os.getenv("EMA_SLOW", str(ema_slow or 60)))
+            # Disable volume filter for EMA ribbon on 1H — backtest showed it hurts performance
+            self.volume_filter = False
+        else:
+            self.ema_fast = None
+            self.ema_med = None
+            self.ema_slow = None
 
         self.in_position = False
         self.entry_price = 0.0
@@ -83,6 +108,10 @@ class RSIEngine:
 
         self.klines_data = []
         self.volumes_data: list[float] = []  # P1: rolling volumes for volume-filter
+        # P2: EMA Ribbon history
+        self.ema_fast_history: list[float] = []
+        self.ema_med_history: list[float] = []
+        self.ema_slow_history: list[float] = []
 
         self.price_precision = 2
         self.qty_precision = 5
@@ -260,8 +289,8 @@ class RSIEngine:
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def calculate_ema(self, closes: list) -> float | None:
-        n = self.ema_period
+    def calculate_ema(self, closes: list, period: int = None) -> float | None:
+        n = period or self.ema_period
         if len(closes) < n:
             return None
         sma = sum(closes[:n]) / n
@@ -415,7 +444,59 @@ class RSIEngine:
                 self._do_sell(current_price, qty, reason="max_drawdown")
                 return
 
-        if current_rsi < self.oversold and current_price > current_ema and not self.is_in_position:
+        if self.strategy_mode == "ema_ribbon":
+            # ── P2: EMA Ribbon (Golden Cross) Strategy ──────────────────────
+            ef, em, es = self.ema_fast_history[-1] if len(self.ema_fast_history) else 0.0, \
+                         self.ema_med_history[-1] if len(self.ema_med_history) else 0.0, \
+                         self.ema_slow_history[-1] if len(self.ema_slow_history) else 0.0
+            ef_prev = self.ema_fast_history[-2] if len(self.ema_fast_history) >= 2 else None
+            em_prev = self.ema_med_history[-2] if len(self.ema_med_history) >= 2 else None
+            if not self.is_in_position and ef > 0 and em > 0 and es > 0 and ef_prev is not None and em_prev is not None:
+                # Golden cross: fast crosses above med, all three aligned upward
+                if ef > em > es and ef_prev <= em_prev:
+                    required_qty = self.min_notional / current_price if current_price > 0 else float("inf")
+                    qty = max(qty, self.format_qty(required_qty))
+                    if current_price * qty < self.min_notional:
+                        self.logger.error(
+                            "Nilai order terlalu kecil (di bawah MIN_NOTIONAL). Harga=%.2f qty=%.8f",
+                            current_price, qty,
+                        )
+                    else:
+                        self.logger.info("Sinyal BUY (EMA Golden Cross %d>%d>%d).",
+                                         self.ema_fast, self.ema_med, self.ema_slow)
+                        try:
+                            if not self._balance_check(self.min_notional):
+                                msg = f"Saldo USDT tidak cukup untuk buy {self.symbol} (min_notional={self.min_notional:.2f})"
+                                self.logger.warning(msg)
+                                if self.notifier:
+                                    self.notifier.warn(msg)
+                                return
+                            resp = self.api.create_order(
+                                symbol=self.symbol, side="BUY", type="MARKET", quantity=qty
+                            )
+                            order_id = int(resp.get("orderId", 0))
+                            if order_id <= 0:
+                                self.logger.error("Response BUY tanpa orderId — order status tidak pasti. Response: %s",
+                                                  {k: resp[k] for k in ("status", "side", "type") if k in resp})
+                                return
+                            fill_price = self._wait_for_fill(order_id, timeout_s=self.order_confirm_timeout)
+                            if fill_price is None:
+                                self.logger.error("Order #%d tidak terisi dalam %ds.", order_id, self.order_confirm_timeout)
+                                return
+                            self.set_entry(fill_price)
+                            self.save_state_to_db()
+                            self.logger.info("BUY CONFIRMED — orderId=%d, avgPrice=%.8f qty=%.8f",
+                                             order_id, fill_price, qty)
+                            if self.notifier:
+                                self.notifier.buy(self.symbol, fill_price, qty, order_id)
+                        except Exception:
+                            self.logger.error("Gagal BUY atau konfirmasi gagal", exc_info=True)
+            elif self.is_in_position:
+                # Exit on trend break: med EMA crosses above fast EMA
+                if em > ef:
+                    self.logger.warning("Trend break! Med(%d) > Fast(%d). Exit posisi.", self.ema_med, self.ema_fast)
+                    self._do_sell(current_price, qty, reason="trend_break")
+        elif current_rsi < self.oversold and current_price > current_ema and not self.is_in_position:
             # P1: Volume spike filter — skip low-volume entries
             if not self._check_volume(current_vol):
                 self.logger.debug(
@@ -573,12 +654,40 @@ class RSIEngine:
         current_rsi = self.calculate_rsi(temp_closes)
         current_ema = self.calculate_ema(temp_closes)
 
+        # P2: Compute and store multi-EMA history for EMA Ribbon strategy
+        if self.strategy_mode == "ema_ribbon":
+            ef = self.calculate_ema(temp_closes, period=self.ema_fast)
+            em = self.calculate_ema(temp_closes, period=self.ema_med)
+            es = self.calculate_ema(temp_closes, period=self.ema_slow)
+            if not math.isnan(ef):
+                self.ema_fast_history.append(ef)
+                if len(self.ema_fast_history) > 200:
+                    self.ema_fast_history.pop(0)
+            if not math.isnan(em):
+                self.ema_med_history.append(em)
+                if len(self.ema_med_history) > 200:
+                    self.ema_med_history.pop(0)
+            if not math.isnan(es):
+                self.ema_slow_history.append(es)
+                if len(self.ema_slow_history) > 200:
+                    self.ema_slow_history.pop(0)
+
         if current_rsi is not None and current_ema is not None:
             if is_closed:
-                self.logger.info(
-                    "[%s] Harga: %.2f | RSI: %.2f | EMA%d: %.2f",
-                    self.symbol, close_price, current_rsi, self.ema_period, current_ema,
-                )
+                if self.strategy_mode == "ema_ribbon":
+                    ef = self.ema_fast_history[-1] if self.ema_fast_history else 0
+                    em = self.ema_med_history[-1] if self.ema_med_history else 0
+                    es = self.ema_slow_history[-1] if self.ema_slow_history else 0
+                    self.logger.info(
+                        "[%s] Harga: %.2f | EMA%d: %.2f | EMA%d: %.2f | EMA%d: %.2f",
+                        self.symbol, close_price,
+                        self.ema_fast, ef, self.ema_med, em, self.ema_slow, es,
+                    )
+                else:
+                    self.logger.info(
+                        "[%s] Harga: %.2f | RSI: %.2f | EMA%d: %.2f",
+                        self.symbol, close_price, current_rsi, self.ema_period, current_ema,
+                    )
             self.execute_logic(close_price, current_rsi, current_ema, current_vol=current_vol)
 
     def on_error(self, ws, error):

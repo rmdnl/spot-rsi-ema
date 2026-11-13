@@ -110,6 +110,10 @@ terus edit `.env` dan isi API key Binance lo. Jangan lupa set `ENVIRONMENT=testn
 | `EMA_TREND_BARS` | `5` | Jumlah bar untuk cek arah trend EMA |
 | `TP_MULT_SL` | `3.0` | **P1 RECOMMENDED**: TP multiplier × SL% (3.0x = R:R 1:3, terbukti profitable) |
 | `ATR_STOP_FRAC` | `0.0` | ATR-based stop (0.0 = pakai fixed %, experimental) |
+| `STRATEGY_MODE` | auto | **P2**: `rsi` = strategy lama, `ema_ribbon` = golden cross baru (auto-detect dari TIMEFRAME) |
+| `EMA_FAST` | `10` | Fast EMA untuk EMA Ribbon mode (default 10) |
+| `EMA_MED` | `30` | Medium EMA untuk EMA Ribbon mode (default 30) |
+| `EMA_SLOW` | `60` | Slow EMA untuk EMA Ribbon mode (default 60) |
 
 ## 🔑 Cara Nyari API Key Binance
 
